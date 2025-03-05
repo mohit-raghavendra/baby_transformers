@@ -21,4 +21,3 @@ class HyperParams(BaseModel):
     n_rows: int = 2
     output_path: str = "./output"
     max_seq_len: int = 1024
-    training_name: str = "default"
