@@ -1,0 +1,14 @@
+[project]
+name = "musings"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "datasets>=3.3.2",
+    "matplotlib>=3.10.0",
+    "notebook>=7.3.2",
+    "numpy>=2.2.3",
+    "pydantic>=2.10.6",
+    "torch>=2.6.0",
+    "transformers>=4.49.0",
+    "wandb>=0.19.7",
+]
