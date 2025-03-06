@@ -15,6 +15,7 @@ I use this to refresh my memory about transformers, as well as interview prep.
 
 ### Training Optimizations
 
+[x] Flash Attention
 [x] Gradient Accumulation
 [x] Mixed Precision Training - torch.autocast
 [x] GMQA / MQA
