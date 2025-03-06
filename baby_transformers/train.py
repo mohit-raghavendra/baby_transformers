@@ -20,6 +20,7 @@ class TrainerParams(Params):
     n_layers: int = 10
     use_rope: bool = True
     activation: str = "silu"
+    use_flash_attn: bool = False
 
 class TrainerHyperParams(HyperParams):
     per_device_batch_size: int = 16
@@ -28,10 +29,11 @@ class TrainerHyperParams(HyperParams):
     learning_rate: float = 0.0001
     weight_decay: float = 0.01
     log_steps: int = 1
-    n_rows: int = 10
+    n_rows: int = 1500
     output_path: str = "./output"
     max_seq_len: int = 1024
     training_name: str = "transformer_vanilla"
+
     
     @property
     def gradient_accumulation_steps(self):
@@ -135,6 +137,7 @@ def main():
         dropout = params.dropout,
         use_rope=params.use_rope,
         activation=params.activation,
+        use_flash_attn=params.use_flash_attn,
     ).to(device=device)
     total_params = sum(p.numel() for p in model.parameters())
 

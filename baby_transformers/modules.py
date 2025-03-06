@@ -3,6 +3,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from flash_attn import flash_attn_func
 
 
 VERBOSE = False
@@ -62,7 +63,7 @@ class RotaryEmbedding(nn.Module):
         return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1) # [(B, h, T, d/2), (B, h, T, d/2)] -> (B, h, T, d)
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, d_model, n_q, n_kv, dropout=0.0, use_rope=True, max_seq_len=512):
+    def __init__(self, d_model, n_q, n_kv, dropout=0.0, use_rope=True, max_seq_len=512, use_flash_attn=True):
         super().__init__()
         assert d_model % n_q == 0, "d_model must be divisible by n_heads."
 
@@ -76,7 +77,8 @@ class MultiHeadAttention(nn.Module):
         self.W_v = nn.Linear(d_model, n_q * self.d_q)
         self.W_o = nn.Linear(n_q * self.d_q, d_model)
         self.dropout = nn.Dropout(dropout)
-
+        self.dropout_p = dropout
+        self.use_flash_attn = use_flash_attn
         self.use_rope = use_rope
         if self.use_rope:
             self.rope = RotaryEmbedding(d=self.d_q, max_seq_len=max_seq_len)
@@ -100,17 +102,28 @@ class MultiHeadAttention(nn.Module):
             q_proj = self.rope(q_proj)
             k_proj = self.rope(k_proj)
 
-        k_proj = k_proj.transpose(-2, -1) # (B, n_q, d_q, T)
+        if self.use_flash_attn:
+            out = flash_attn_func(
+                q = q_proj.to(torch.bfloat16),
+                k = k_proj.to(torch.bfloat16),
+                v = v_proj.to(torch.bfloat16),
+                dropout_p=self.dropout_p,
+                causal=True,
+            ).to(dtype=q_proj.dtype)
+        else:
+            # Our implementation
+            k_proj = k_proj.transpose(-2, -1) # (B, n_q, d_q, T)
 
-        scores = torch.matmul(q_proj, k_proj) / math.sqrt(self.d_q) # (B, n_q, [T, d_q]) * (B, n_kv, [d_q, T])
-        scores = scores.masked_fill(mask==0, float("-inf"))
+            scores = torch.matmul(q_proj, k_proj) / math.sqrt(self.d_q) # (B, n_q, [T, d_q]) * (B, n_kv, [d_q, T])
+            scores = scores.masked_fill(mask==0, float("-inf"))
 
-        attn = F.softmax(scores, dim=-1)
-        attn = self.dropout(attn)
+            attn = F.softmax(scores, dim=-1)
+            attn = self.dropout(attn)
 
-        out = torch.matmul(attn, v_proj) # (B, n_q, T, T) * (B, n_q, T, d_q) -> (B, n_q, T, d_q)
-        out = out.transpose(2, 1).reshape(B, T, self.n_q * self.d_q) # (B, T, n_q, d_kv) -> (B, T, d_model)
+            out = torch.matmul(attn, v_proj) # (B, n_q, T, T) * (B, n_q, T, d_q) -> (B, n_q, T, d_q)
+            out = out.transpose(2, 1)
 
+        out = out.reshape(B, T, self.n_q * self.d_q) # (B, T, n_q, d_kv) -> (B, T, d_model)
         out_proj = self.W_o(out) # (B, T, d_model)
 
         if VERBOSE:
@@ -131,7 +144,7 @@ class MultiHeadAttention(nn.Module):
 
 
 class GroupedMultiQueryAttention(nn.Module):
-    def __init__(self, d_model, n_q, n_kv, dropout=0.0, use_rope=True, max_seq_len=512):
+    def __init__(self, d_model, n_q, n_kv, dropout=0.0, use_rope=True, max_seq_len=512, use_flash_attn=True):
         super().__init__()
         assert d_model % n_q == 0, "d_model must be divisible by n_q."
         assert d_model % n_kv == 0, "d_model must be divisible by n_kv."
@@ -147,8 +160,10 @@ class GroupedMultiQueryAttention(nn.Module):
         self.W_k = nn.Linear(d_model, n_kv * self.d_q)
         self.W_v = nn.Linear(d_model, n_kv * self.d_q)
         self.W_o = nn.Linear(n_q * self.d_q, d_model)
+        self.dropout_p = dropout
         self.dropout = nn.Dropout(dropout)
         self.use_rope = use_rope
+        self.use_flash_attn = use_flash_attn
         if self.use_rope:
             self.rope = RotaryEmbedding(d=self.d_q, max_seq_len=max_seq_len)
 
@@ -171,27 +186,38 @@ class GroupedMultiQueryAttention(nn.Module):
             q_proj = self.rope(q_proj)
             k_proj = self.rope(k_proj)
             
-        if self.n_q > self.n_kv:
-            repeat_factor = self.n_q // self.n_kv
-            k_proj = k_proj.repeat(1, repeat_factor, 1, 1)  # (B, n_kv*repeat_factor, T, d_k) which is equal to (B, n_q, T, d_k)
-            v_proj = v_proj.repeat(1, repeat_factor, 1, 1)
+        if self.use_flash_attn:
+            out = flash_attn_func(
+                q = q_proj.to(torch.bfloat16),
+                k = k_proj.to(torch.bfloat16),
+                v = v_proj.to(torch.bfloat16),
+                dropout_p=self.dropout_p,
+                causal=True,
+            ).to(dtype=q_proj.dtype)
+        else:
+            # Our implementation
+            if self.n_q > self.n_kv:
+                repeat_factor = self.n_q // self.n_kv
+                k_proj = k_proj.repeat(1, repeat_factor, 1, 1)  # (B, n_kv*repeat_factor, T, d_k) which is equal to (B, n_q, T, d_k)
+                v_proj = v_proj.repeat(1, repeat_factor, 1, 1)
 
-        k_proj = k_proj.transpose(-2, -1) # (B, n_kv, d_q, T)
+            k_proj = k_proj.transpose(-2, -1) # (B, n_kv, d_q, T)
 
-        scores = torch.matmul(q_proj, k_proj) / math.sqrt(self.d_q) # (B, n_q, [T, d_q]) * (B, n_kv, [d_q, T])
-        scores = scores.masked_fill(mask==0, float("-inf"))
-
-
-        attn = F.softmax(scores, dim=-1)
-        attn = self.dropout(attn)
+            scores = torch.matmul(q_proj, k_proj) / math.sqrt(self.d_q) # (B, n_q, [T, d_q]) * (B, n_kv, [d_q, T])
+            scores = scores.masked_fill(mask==0, float("-inf"))
 
 
-        out = torch.matmul(attn, v_proj) # (B, n_q, T, T) * (B, n_kv, T, d_q) -> (B, n_q, T, d_q)
-        out = out.transpose(2, 1).reshape(B, T, self.n_q * self.d_q) # (B, T, n_q, d_kv) -> (B, T, d_model)
+            attn = F.softmax(scores, dim=-1)
+            attn = self.dropout(attn)
 
+            out = torch.matmul(attn, v_proj) # (B, n_q, T, T) * (B, n_kv, T, d_q) -> (B, n_q, T, d_q)
+            out = out.transpose(2, 1)
+        
+        out = out.reshape(B, T, self.n_q * self.d_q) # (B, T, n_q, d_kv) -> (B, T, d_model)
         out_proj = self.W_o(out) # (B, T, d_model)
 
         if VERBOSE:
+            print(f"Using Flash Attention: {self.use_flash_attn}")
             print("Attention module shapes")
             print(f"Input size - {x.size()}")
 
@@ -199,11 +225,11 @@ class GroupedMultiQueryAttention(nn.Module):
             print(f"k_proj - {k_proj.size()}")
             print(f"v_proj - {v_proj.size()}")
 
-            print(f"QK scores - {scores.size()}") # (B, n_q, T, T)
-
-            print(f"attention matrix - {attn.size()}")
-            print(f"out size - {out.size()}")
-            print(f"out proj size - {out_proj.size()}")
+            if not self.use_flash_attn:
+                print(f"QK scores - {scores.size()}") # (B, n_q, T, T)
+                print(f"attention matrix - {attn.size()}")
+                print(f"out size - {out.size()}")
+                print(f"out proj size - {out_proj.size()}")
 
         return out_proj
 
@@ -307,10 +333,21 @@ class MoEMLP(nn.Module):
 
 
 class TransformerLayer(nn.Module):
-    def __init__(self, n_q, n_kv, d_model, d_ff, dropout=0.0, use_rope=True, max_seq_len=1024, activation="silu"):
+    def __init__(self, n_q, n_kv, d_model, d_ff, n_experts=1, top_k=1, dropout=0.0, use_rope=True, max_seq_len=1024, activation="silu", use_flash_attn=True):
         super().__init__()
-        self.self_attn = GroupedMultiQueryAttention(d_model=d_model, n_q=n_q, n_kv=n_kv, dropout=dropout, use_rope=use_rope, max_seq_len=max_seq_len)
-        self.mlp = MLP(d_model, d_ff, dropout, activation)
+        
+        if n_q == n_kv:
+            self.self_attn = MultiHeadAttention(d_model=d_model, n_q=n_q, n_kv=n_kv, dropout=dropout, use_rope=use_rope, max_seq_len=max_seq_len)
+        else:
+            self.self_attn = GroupedMultiQueryAttention(d_model=d_model, n_q=n_q, n_kv=n_kv, dropout=dropout, use_rope=use_rope, max_seq_len=max_seq_len, use_flash_attn=use_flash_attn)
+
+        if n_experts > 1:
+            assert 1 <= top_k <= n_experts, "top_k must be between 1 and n_experts."
+            self.mlp = MoEMLP(d_model, d_ff, n_experts, top_k, dropout, activation)
+        else:
+            self.mlp = MLP(d_model, d_ff, dropout, activation)
+
+        
 
         self.norm1 = nn.RMSNorm(d_model)
         self.norm2 = nn.RMSNorm(d_model)
@@ -327,30 +364,8 @@ class TransformerLayer(nn.Module):
 
         return out
 
-
-class TransformerMoELayer(nn.Module):
-    def __init__(self, n_q, n_kv, d_model, d_ff, n_experts, top_k, dropout=0.0, use_rope=True, max_seq_len=1024, activation="silu"):
-        super().__init__()
-        self.self_attn = GroupedMultiQueryAttention(d_model=d_model, n_q=n_q, n_kv=n_kv, dropout=dropout, use_rope=use_rope, max_seq_len=max_seq_len)
-        self.moe_mlp = MoEMLP(d_model=d_model, d_ff=d_ff, n_experts=n_experts, top_k=top_k, dropout=dropout, activation_type=activation)
-
-        self.norm1 = nn.RMSNorm(d_model)
-        self.norm2 = nn.RMSNorm(d_model)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x, mask=None):
-        attn_out = self.self_attn(x, mask)
-        attn_out = x + self.dropout(attn_out)
-        h = self.norm1(attn_out)
-
-        mlp_out = self.moe_mlp(h)
-        mlp_out = h + self.dropout(mlp_out)
-        out = self.norm2(mlp_out)
-
-        return out
-
 class LLM(nn.Module):
-    def __init__(self, vocab_size, max_seq_len, n_layers, d_model, d_ff, n_q, n_kv, dropout, use_rope=True, activation="silu"):
+    def __init__(self, vocab_size, max_seq_len, n_layers, d_model, d_ff, n_q, n_kv, dropout, use_rope=True, activation="silu", use_flash_attn=True, n_experts=1, top_k=1):
         super().__init__()
         self.vocab_size = vocab_size
         self.max_seq_len = max_seq_len
@@ -360,6 +375,8 @@ class LLM(nn.Module):
         self.n_q = n_q
         self.n_kv = n_kv
         self.dropout = dropout
+        self.use_rope = True
+        self.use_flash_attn = use_flash_attn    
 
         self.token_embedding = InputEmbedding(self.vocab_size, self.d_model)
         self.positional_embedding = PositionalEmbedding(max_seq_len=max_seq_len, d_model=d_model)
@@ -373,7 +390,10 @@ class LLM(nn.Module):
                 dropout = dropout,
                 use_rope = use_rope,
                 max_seq_len = max_seq_len, 
-                activation=activation
+                activation=activation,
+                use_flash_attn=use_flash_attn,
+                n_experts=n_experts,
+                top_k=top_k
             )
         for _ in range(n_layers)])
 
@@ -408,72 +428,6 @@ class LLM(nn.Module):
         return logits
     
 
-class LLMMoE(nn.Module):
-    def __init__(self, vocab_size, max_seq_len, n_layers, d_model, d_ff, n_q, n_kv, dropout, n_experts, top_k, use_rope=True, activation="silu"):
-        super().__init__()
-        self.vocab_size = vocab_size
-        self.max_seq_len = max_seq_len
-        self.n_layers = n_layers
-        self.d_model = d_model
-        self.d_ff = d_ff
-        self.n_q = n_q
-        self.n_kv = n_kv
-        self.dropout = dropout
-        self.use_rope = True
-        self.token_embedding = InputEmbedding(self.vocab_size, self.d_model)
-
-        if not self.use_rope:
-            self.positional_embedding = PositionalEmbedding(max_seq_len=max_seq_len, d_model=d_model)
-
-        self.layers = nn.ModuleList([
-            TransformerMoELayer(
-                d_model = d_model,
-                n_q = n_q,
-                n_kv = n_kv,
-                d_ff = d_ff,
-                dropout = dropout,
-                n_experts = n_experts,
-                top_k = top_k,
-                use_rope = use_rope,
-                max_seq_len = max_seq_len,
-                activation=activation
-            )
-        for _ in range(n_layers)])
-
-        self.final_norm = nn.RMSNorm(d_model)
-        self.final_head = nn.Linear(d_model, vocab_size, bias=False)
-
-
-    def forward(self, x):
-
-        token_embedding = self.token_embedding(x)
-        positional_embedding = self.positional_embedding(token_embedding)
-
-        h = token_embedding
-        if not self.use_rope:
-            h += positional_embedding
-        _, n, _ = h.size()
-
-        mask = torch.tril(torch.ones(n, n, device=x.device)).unsqueeze(0).unsqueeze(0)
-
-        for layer in self.layers:
-            h = layer(h, mask)
-
-        h = self.final_norm(h)
-        logits = self.final_head(h)
-
-        if VERBOSE:
-            print("LLM module shapes")
-            print(f"Input size - {x.size()}")
-            print(f"Token embedding size - {token_embedding.size()}")
-            print(f"Positional embedding size - {positional_embedding.size()}")
-            print(f"Input size - {h.size()}")
-            print(f"Output size - {logits.size()}")
-
-        return logits
-
-
-
 if __name__ == "__main__":
 
     from pydantic import BaseModel
@@ -504,9 +458,14 @@ if __name__ == "__main__":
         n_q = params.n_q,
         n_kv = params.n_kv,
         dropout = params.dropout,
-    )
+        use_rope = True,
+        activation="silu",
+        use_flash_attn=True,
+        n_experts=1,
+        top_k=1
+    ).to("cuda")
 
-    x = torch.randint(0, 10000, (n_seq, seq_len))
+    x = torch.randint(0, 10000, (n_seq, seq_len)).to("cuda")
     out = model(x)
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -514,33 +473,33 @@ if __name__ == "__main__":
 
     print(out.size())
 
-    model = LLMMoE(
-        vocab_size = params.vocab_size,
-        max_seq_len = params.max_seq_len,
-        n_layers = params.n_layers,
-        d_model = params.d_model,
-        d_ff = params.d_ff,
-        n_q = params.n_q,
-        n_kv = params.n_kv,
-        dropout = params.dropout,
-        n_experts = params.n_experts,
-        top_k = params.top_k
-    )
+    # model = LLMMoE(
+    #     vocab_size = params.vocab_size,
+    #     max_seq_len = params.max_seq_len,
+    #     n_layers = params.n_layers,
+    #     d_model = params.d_model,
+    #     d_ff = params.d_ff,
+    #     n_q = params.n_q,
+    #     n_kv = params.n_kv,
+    #     dropout = params.dropout,
+    #     n_experts = params.n_experts,
+    #     top_k = params.top_k
+    # )
 
-    x = torch.randint(0, 10000, (n_seq, seq_len))
-    out = model(x)
+    # x = torch.randint(0, 10000, (n_seq, seq_len))
+    # out = model(x)
 
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"Total parameters: {format(total_params, ',')}")
+    # total_params = sum(p.numel() for p in model.parameters())
+    # print(f"Total parameters: {format(total_params, ',')}")
 
-    print(out.size())
+    # print(out.size())
 
 
-    rope = RotaryEmbedding(512)
+    # rope = RotaryEmbedding(512)
 
-    x = torch.randn(1, 8, 32, 512)
-    out = rope(x)
-    print(out.size())
+    # x = torch.randn(1, 8, 32, 512)
+    # out = rope(x)
+    # print(out.size())
 
 
 

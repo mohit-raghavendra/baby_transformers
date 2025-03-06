@@ -18,8 +18,8 @@ I use this to refresh my memory about transformers, as well as interview prep.
 [x] Gradient Accumulation
 [x] Mixed Precision Training - torch.autocast
 [x] GMQA / MQA
-
-
+[x] Flash Attention Support
+ 
 ### Distributed Training
 
 [x] DDP (Data Parallel) <br>
