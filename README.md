@@ -1,24 +1,24 @@
 
-This is am educational Transformers training library. I created this to understand the core mechanics of transformers, implementing everything in pure pytorch (other than distributed training)
+This is an educational Transformers training library. I created this to understand the core mechanics of transformers, implementing everything in pure pytorch (other than distributed training of course)
 
-I use this to refresh my memory about transformers, as well as interview prep. 
+Use cases include refreshing your memory about transformers, interview prep, matrix-mechanics, etc. 
 
 
 ## Checklist
 
 ### Transformer Architecture
 
-[x] GPT-2
-[x] Llama
+[x] GPT-2 <br>
+[x] Llama <br>
 
-[x] MoE 
+[x] MoE <br>
 
 ### Training Optimizations
 
-[x] Flash Attention
-[x] Gradient Accumulation
-[x] Mixed Precision Training - torch.autocast
-[x] GMQA / MQA
+[x] Flash Attention <br>
+[x] Gradient Accumulation <br>
+[x] Mixed Precision Training - torch.autocast <br>
+[x] GMQA / MQA <br>
 
 
 ### Distributed Training
